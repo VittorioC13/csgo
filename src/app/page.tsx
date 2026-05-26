@@ -8,6 +8,12 @@ const cards = [
     tag: "reflex",
   },
   {
+    href: "/strafe",
+    title: "Counter-strafe",
+    blurb: "WASD movement with CS-accurate friction. Tap A↔D and W↔S to stop on a dime — the single highest-leverage mechanic.",
+    tag: "movement",
+  },
+  {
     href: "/strategy",
     title: "Strategy board",
     blurb: "Top-down Dust 2. Drag T/CT players, drop smokes, flashes, mollies. Save your setups.",
