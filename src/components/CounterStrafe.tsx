@@ -5,10 +5,14 @@ const ARENA_W = 900;
 const ARENA_H = 560;
 const PLAYER_R = 14;
 const DOT_R = 16;
-const MAX_SPEED = 320;           // u/s, max ground speed
-const INPUT_ACCEL = 2200;        // u/s² toward target velocity when key held
-const FRICTION_DECEL = 480;      // u/s² when no key held (slow stop without counter-strafe)
-const ACCURATE_VELOCITY = 18;    // |v| under this counts as "stopped"
+// CS2 / Source-engine ground movement (sv_* values)
+const MAX_SPEED = 250;           // sv_maxspeed — ground speed carrying a rifle
+const ACCELERATE = 5.5;          // sv_accelerate
+const FRICTION = 5.2;            // sv_friction
+const STOP_SPEED = 80;           // sv_stopspeed
+const TICK_RATE = 128;           // CS2 tick — physics steps at this rate
+const TICK_DT = 1 / TICK_RATE;
+const ACCURATE_VELOCITY = 25;    // |v| under this counts as "stopped" for the shot
 const SESSION_MS = 60_000;
 
 type Stats = {
@@ -29,10 +33,49 @@ type GameState = {
   cursorY: number;
   startedAt: number;
   lastTick: number;
+  accumulator: number;
   stats: Stats;
   flashTimer: number;
   flashKind: "" | "hit" | "miss";
 };
+
+// Source engine ground-movement tick. Friction always applied, then acceleration
+// toward wishdir. When you press the OPPOSITE key (release the movement key and
+// tap the counter), wishdir flips and the accel term zeros velocity in 5-7 ticks
+// (~50-90ms). Holding both keys at once gives wishdir = 0 — pure friction, slow.
+function physicsTick(s: GameState, dt: number) {
+  let wx = (s.keys.d ? 1 : 0) - (s.keys.a ? 1 : 0);
+  let wy = (s.keys.s ? 1 : 0) - (s.keys.w ? 1 : 0);
+  const wishLen = Math.hypot(wx, wy);
+  if (wishLen > 0) { wx /= wishLen; wy /= wishLen; }
+
+  const speed = Math.hypot(s.vx, s.vy);
+  if (speed > 0) {
+    const control = speed < STOP_SPEED ? STOP_SPEED : speed;
+    const drop = control * FRICTION * dt;
+    const newSpeed = Math.max(0, speed - drop);
+    const factor = newSpeed / speed;
+    s.vx *= factor;
+    s.vy *= factor;
+  }
+
+  if (wishLen > 0) {
+    const currentSpeed = s.vx * wx + s.vy * wy;
+    const addSpeed = MAX_SPEED - currentSpeed;
+    if (addSpeed > 0) {
+      const accelSpeed = Math.min(ACCELERATE * MAX_SPEED * dt, addSpeed);
+      s.vx += wx * accelSpeed;
+      s.vy += wy * accelSpeed;
+    }
+  }
+
+  s.px += s.vx * dt;
+  s.py += s.vy * dt;
+  if (s.px < PLAYER_R) { s.px = PLAYER_R; s.vx = 0; }
+  if (s.px > ARENA_W - PLAYER_R) { s.px = ARENA_W - PLAYER_R; s.vx = 0; }
+  if (s.py < PLAYER_R) { s.py = PLAYER_R; s.vy = 0; }
+  if (s.py > ARENA_H - PLAYER_R) { s.py = ARENA_H - PLAYER_R; s.vy = 0; }
+}
 
 const emptyStats = (): Stats => ({ hits: 0, misses: 0, movingShots: 0, elapsedMs: 0 });
 
@@ -64,6 +107,7 @@ export default function CounterStrafe() {
     cursorY: 0,
     startedAt: 0,
     lastTick: 0,
+    accumulator: 0,
     stats: emptyStats(),
     flashTimer: 0,
     flashKind: "",
@@ -108,38 +152,12 @@ export default function CounterStrafe() {
       const dt = s.lastTick === 0 ? 0 : Math.min(0.05, (t - s.lastTick) / 1000);
       s.lastTick = t;
 
-      // Target velocity from keys (D = +x, A = -x; S = +y, W = -y)
-      const tx = (s.keys.d ? MAX_SPEED : 0) - (s.keys.a ? MAX_SPEED : 0);
-      const ty = (s.keys.s ? MAX_SPEED : 0) - (s.keys.w ? MAX_SPEED : 0);
-      const inputX = s.keys.a || s.keys.d;
-      const inputY = s.keys.w || s.keys.s;
-
-      // X-axis
-      if (inputX) {
-        const diff = tx - s.vx;
-        const step = INPUT_ACCEL * dt;
-        s.vx += Math.abs(diff) <= step ? diff : Math.sign(diff) * step;
-      } else if (s.vx !== 0) {
-        const step = FRICTION_DECEL * dt;
-        s.vx = Math.abs(s.vx) <= step ? 0 : s.vx - Math.sign(s.vx) * step;
+      // Fixed-rate physics — run as many 128-tick steps as the frame covers.
+      s.accumulator += dt;
+      while (s.accumulator >= TICK_DT) {
+        physicsTick(s, TICK_DT);
+        s.accumulator -= TICK_DT;
       }
-      // Y-axis
-      if (inputY) {
-        const diff = ty - s.vy;
-        const step = INPUT_ACCEL * dt;
-        s.vy += Math.abs(diff) <= step ? diff : Math.sign(diff) * step;
-      } else if (s.vy !== 0) {
-        const step = FRICTION_DECEL * dt;
-        s.vy = Math.abs(s.vy) <= step ? 0 : s.vy - Math.sign(s.vy) * step;
-      }
-
-      s.px += s.vx * dt;
-      s.py += s.vy * dt;
-      // Walls (clamp + bleed velocity)
-      if (s.px < PLAYER_R) { s.px = PLAYER_R; s.vx = 0; }
-      if (s.px > ARENA_W - PLAYER_R) { s.px = ARENA_W - PLAYER_R; s.vx = 0; }
-      if (s.py < PLAYER_R) { s.py = PLAYER_R; s.vy = 0; }
-      if (s.py > ARENA_H - PLAYER_R) { s.py = ARENA_H - PLAYER_R; s.vy = 0; }
 
       if (s.flashTimer > 0) s.flashTimer = Math.max(0, s.flashTimer - dt * 1000);
 
@@ -176,6 +194,7 @@ export default function CounterStrafe() {
     s.stats = emptyStats();
     s.startedAt = performance.now();
     s.lastTick = 0;
+    s.accumulator = 0;
     s.flashTimer = 0;
     s.flashKind = "";
     setStats(emptyStats());
@@ -244,9 +263,10 @@ export default function CounterStrafe() {
         </div>
         <div className="space-y-2 border-t border-[var(--border)] pt-3 text-xs text-[var(--text-muted)]">
           <p className="font-semibold text-[var(--text)]">How to counter-strafe</p>
-          <p>1. Move with WASD — notice your velocity bar grows.</p>
-          <p>2. To stop instantly, <span className="text-[var(--accent)]">tap the opposite key</span> (D moving right → tap A). Hold too long and you reverse.</p>
-          <p>3. Click only when the state shows ACCURATE. Moving-shots don&rsquo;t score and count against you.</p>
+          <p>1. Move with WASD — velocity ramps up to ~250 u/s.</p>
+          <p>2. To stop instantly: <span className="text-[var(--accent)]">release</span> the move key and <span className="text-[var(--accent)]">tap the opposite</span> (D → release D + tap A). The opposing wishdir zeroes velocity in ~80 ms.</p>
+          <p>3. Holding both keys at once cancels your input (pure friction, ~400 ms to stop) — the slow path.</p>
+          <p>4. Click only when ACCURATE. Moving shots don&rsquo;t score.</p>
         </div>
       </aside>
       <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] p-2">
